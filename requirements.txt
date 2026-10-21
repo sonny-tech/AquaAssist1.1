@@ -1,0 +1,7 @@
+streamlit
+pdfplumber
+python-docx
+fpdf
+gensim
+scikit-learn
+numpy

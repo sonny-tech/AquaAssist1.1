@@ -1,0 +1,11 @@
+# Base theme for the dusk dive look. assets/style.css does the rest.
+[theme]
+base = "dark"
+primaryColor = "#5ad0e6"
+backgroundColor = "#050a14"
+secondaryBackgroundColor = "#0b1730"
+textColor = "#e6edf8"
+font = "monospace"
+
+[client]
+toolbarMode = "minimal"

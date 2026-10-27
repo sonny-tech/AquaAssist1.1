@@ -1,21 +1,16 @@
 import os
 import re
 import math
-import base64
 import streamlit as st
 import pdfplumber
 from docx import Document
 from fpdf import FPDF
-from gensim.models import Word2Vec
-from gensim.utils import simple_preprocess
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+
+import ui
 
 # ------------------ CONFIG ------------------
 
-st.set_page_config(page_title="AquaAssist 1.1", layout="centered")
-st.title("AquaAssist 1.1")
-st.caption("Example: **'Tiny Tots Level 5 — Back Crawl, Front Crawl'**")
+ui.setup_page(st.session_state.get("step", "program"))  # page config + styling; must come first
 
 LEVELS_DIR = "skill_tracking"       # PDFs named after levels e.g. "Tiny Tots Level 5 Sting Rays Must Sees.pdf"
 PROGRESSIONS_DIR = "lesson_progressions"  # Docx files named after skills e.g. "Back Crawl.docx"
@@ -36,71 +31,114 @@ def get_all_progression_names():
         if f.lower().endswith(".docx")
     ]
 
-def extract_level_number(text):
-    """Pull the first number found in the text, e.g. 'Swimmer 4' -> '4',
-    'Junior Masters 4' -> '4', 'Tiny Tots Level 5' -> '5'.
+# Order the level groups appear in on screen; any other groups follow alphabetically.
+GROUP_ORDER = ["Tiny Tots", "Swimmer", "Junior Masters"]
 
-    Generalized from a 'level'-only regex so the same exact-number-match
-    logic works across all naming conventions (Level, Swimmer, Junior
-    Masters, etc.) instead of just filenames containing the word 'level'.
+
+def list_levels():
+    """Every level PDF in LEVELS_DIR as {"name", "path", "group", "number"}, sorted by number.
+
+    'Tiny_Tots_Level_5_Sting_Rays_Must_Sees.pdf' -> name 'Tiny Tots Level 5 Sting Rays',
+    group 'Tiny Tots'. 'Swimmer_3_Must_Sees.pdf' -> name 'Swimmer 3', group 'Swimmer'.
     """
-    match = re.search(r"\d+", text)
-    return match.group(0) if match else None
-
-def get_level_pdf_path(user_input):
-    """Match user input to a level PDF filename.
-
-    Prioritizes an exact level-number match (e.g. 'Level 5' only matches
-    filenames containing 'Level 5', not 'Level 1', 'Level 15', etc.) before
-    falling back to generic word overlap. This avoids the old bug where
-    every level shared common words like 'tiny'/'tots'/'level' and the
-    first PDF in the OS listing order would win regardless of which level
-    number was actually requested.
-    """
-    if not os.path.exists(LEVELS_DIR):
-        return None, None
-
-    normalized = user_input.lower().replace(" ", "_")
-    user_level_num = extract_level_number(user_input)
-
-    candidates = []
+    levels = []
+    if not os.path.isdir(LEVELS_DIR):
+        return levels
     for f in os.listdir(LEVELS_DIR):
         if not f.lower().endswith(".pdf"):
             continue
-        clean_name = os.path.splitext(f)[0].lower().replace("_must_sees", "").strip("_")
-        display_name = clean_name.replace("_", " ").title()
-        file_level_num = extract_level_number(clean_name.replace("_", " "))
-        words = [w for w in clean_name.split("_") if len(w) > 3]
-        overlap = sum(1 for w in words if w in normalized)
-        candidates.append((f, display_name, file_level_num, overlap))
+        stem = os.path.splitext(f)[0]
+        name = re.sub(r"[_\s]+must[_\s]*sees$", "", stem, flags=re.IGNORECASE)
+        name = " ".join(name.replace("_", " ").split())
+        digit = re.search(r"\d+", name)
+        prefix = name[: digit.start()].strip() if digit else name
+        group = re.sub(r"\s+level$", "", prefix, flags=re.IGNORECASE).strip() or name
+        levels.append({
+            "name": name,
+            "path": os.path.join(LEVELS_DIR, f),
+            "group": group,
+            "number": int(digit.group()) if digit else 0,
+        })
+    levels.sort(key=lambda l: (l["number"], l["name"].lower()))
+    return levels
 
-    # Prefer an exact level-number match, breaking ties with word overlap
-    if user_level_num:
-        exact_matches = [c for c in candidates if c[2] == user_level_num]
-        if exact_matches:
-            best = max(exact_matches, key=lambda c: c[3])
-            return os.path.join(LEVELS_DIR, best[0]), best[1]
 
-    # Fallback: best generic word overlap (only if something actually matched)
-    if candidates:
-        best = max(candidates, key=lambda c: c[3])
-        if best[3] > 0:
-            return os.path.join(LEVELS_DIR, best[0]), best[1]
+def ordered_groups(levels):
+    groups = sorted({l["group"] for l in levels}, key=str.lower)
+    preferred = [g for want in GROUP_ORDER for g in groups if g.lower() == want.lower()]
+    return preferred + [g for g in groups if g not in preferred]
 
-    return None, None
 
-def get_must_sees_from_level(pdf_path):
-    """Extract all must-see skill names from a level PDF."""
-    must_sees = []
+def skills_for_level(level_path):
+    """The level's must-sees as pickable skills, grouped under the PDF's headings, plus every other skill.
+
+    A must-see that starts with the name of a skill that has a progression doc is listed under that
+    skill's name (synonyms count, so 'Tread water 30 sec.' finds Treading Water). A must-see with no
+    progression doc is listed as itself, and goes into the plan as written.
+    Returns (sections, others): sections is [(heading, [skill, ...])] in PDF order, and others
+    are the progression-doc skills this level's must-sees don't mention.
+    """
+    known = sorted(get_all_progression_names(), key=str.lower)
+    keys = {s: normalize_name(s) for s in known}
+    sections, seen = [], set()
+    for heading, text in parse_must_sees(level_path):
+        line = normalize_name(text)
+        # The line has to start with the skill's name, so 'Front Crawl 15m' is the Front Crawl skill but
+        # 'Interval training: 4 x 15m flutter kick...' stays its own must-see.
+        hits = [s for s in known if keys[s] and line.startswith(keys[s])]
+        # If two names both fit, the longer one wins (Legs Only Treading Water over a shorter name).
+        hits = [s for s in hits if not any(keys[s] != keys[o] and keys[o].startswith(keys[s]) for o in hits)]
+        for skill in hits or [text]:
+            if skill in seen:
+                continue
+            seen.add(skill)
+            if not sections or sections[-1][0] != heading:
+                sections.append((heading, []))
+            sections[-1][1].append(skill)
+    others = [s for s in known if s not in seen]
+    return sections, others
+
+
+# A bullet at the start of a line: a real bullet, the "(cid:127)" some PDFs extract it as, or a dash.
+_BULLET = re.compile(r"^\s*(?:•|\(cid:\d+\)|[·▪●◦■‣*]|[-–—])\s*")
+
+
+def parse_must_sees(pdf_path):
+    """Read a level's must-sees PDF into [(heading, text)], one entry per bulleted line.
+
+    Lines without a bullet are headings ('Surface Support') and become the heading of the bullets
+    that follow; the first line is the level's title and is skipped. A line that starts in lower
+    case right after a bullet is the wrapped end of that bullet.
+    """
+    rows = []  # ["item" | "head", text]
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for line in text.split("\n"):
-                    line = line.strip().lstrip("•").strip()
-                    if line and not line.endswith(":"):  # skip category headers
-                        must_sees.append(line)
-    return must_sees
+            for raw in (page.extract_text() or "").split("\n"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                bullet = _BULLET.match(raw)
+                if bullet:
+                    rows.append(["item", raw[bullet.end():].strip()])
+                elif rows and rows[-1][0] == "item" and raw[0].islower():
+                    rows[-1][1] += " " + raw
+                else:
+                    rows.append(["head", raw])
+    if not any(kind == "item" for kind, _ in rows):  # no bullets at all: every line is a must-see
+        return [("", text) for _, text in rows]
+    items, heading = [], ""
+    for i, (kind, text) in enumerate(rows):
+        if kind == "head":
+            if i > 0:
+                heading = text.rstrip(":").strip()
+        elif text:
+            items.append((heading, text))
+    return items
+
+
+def get_must_sees_from_level(pdf_path):
+    """Just the text of each must-see line (used to look up distances and times)."""
+    return [text for _, text in parse_must_sees(pdf_path)]
 
 
 # Alternate names swimmers/parents commonly use that should be treated as
@@ -113,6 +151,7 @@ SKILL_SYNONYMS = {
     "freestyle": "front crawl",
     "backstroke": "back crawl",
     "back paddle": "back kick w scull/paddle",
+    "back kick with scull/paddle": "back kick w scull/paddle",
     "front glide": "glide on front",
     "back glide": "glide on back",
     "front float": "float on front",
@@ -134,7 +173,7 @@ SKILL_SYNONYMS = {
 # to that alias's match pattern so it only fires when NOT followed by the
 # start of one of those longer names.
 _SYNONYM_EXCLUDE_AFTER = {
-    "back kick": r"(?!\s*w\s*scull/?paddle)",
+    "back kick": r"(?!\s*(?:w|with)\W*scull\W*paddle)",
     "flutter kick": r"(?!\s*on\s*(?:back|front|side))",
     "jump entry into deep water and tread": r"(?!\s*water)",
 }
@@ -235,67 +274,6 @@ def find_distance_for_skill(skill_name, must_sees_lines, kind=None):
                     if kind is None or _unit_kind(match.group(2)) == kind:
                         return _value_from_match(match)
     return None
-
-
-# ------------------ WORD2VEC MATCHING ------------------
-
-@st.cache_resource
-def build_word2vec_model():
-    """Build Word2Vec model from all progression names."""
-    skill_names = get_all_progression_names()
-    if not skill_names:
-        return None, []
-    corpus = [simple_preprocess(name) for name in skill_names]
-    model = Word2Vec(corpus, vector_size=50, window=3, min_count=1, workers=2, epochs=100)
-    return model, skill_names
-
-def get_sentence_vector(model, tokens):
-    """Average word vectors to get a sentence vector."""
-    vectors = [model.wv[t] for t in tokens if t in model.wv]
-    if not vectors:
-        return np.zeros(model.vector_size)
-    return np.mean(vectors, axis=0)
-
-def match_skill(query, model, skill_names):
-    """
-    Match a user query to the closest skill name using:
-    1. Exact match first (synonym-aware, e.g. 'Freestyle' == 'Front Crawl')
-    2. Word2Vec cosine similarity as fallback
-    """
-    query_clean = query.strip().lower()
-    query_canonical = canonicalize_skill_text(query_clean)
-
-    # Exact match (synonym-aware)
-    for skill in skill_names:
-        if canonicalize_skill_text(skill.lower()) == query_canonical:
-            return skill
-
-    # Partial match (synonym-aware)
-    for skill in skill_names:
-        skill_canonical = canonicalize_skill_text(skill.lower())
-        if query_canonical in skill_canonical or skill_canonical in query_canonical:
-            return skill
-
-    # Word2Vec semantic match
-    if model is None:
-        return None
-
-    query_tokens = simple_preprocess(query_canonical)
-    query_vec = get_sentence_vector(model, query_tokens).reshape(1, -1)
-
-    best_skill = None
-    best_score = -1
-
-    for skill in skill_names:
-        skill_tokens = simple_preprocess(skill.lower())
-        skill_vec = get_sentence_vector(model, skill_tokens).reshape(1, -1)
-        score = cosine_similarity(query_vec, skill_vec)[0][0]
-        if score > best_score:
-            best_score = score
-            best_skill = skill
-
-    # Only return if similarity is above threshold
-    return best_skill if best_score > 0.4 else None
 
 
 # ------------------ PROGRESSION PARSING ------------------
@@ -472,210 +450,357 @@ class LessonPDF(LessonPlanPDF):
     total_time = None
 
 
-# ------------------ PDF DISPLAY ------------------
+# ------------------ LESSON PLAN GENERATION ------------------
 
-def display_pdf(path):
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    st.markdown(
-        f"""
-        <iframe
-            src="data:application/pdf;base64,{b64}"
-            width="100%"
-            height="650"
-            style="border:none; border-radius:8px;">
-        </iframe>
-        """,
-        unsafe_allow_html=True,
+OTHER_SECTION = "Other must-sees"  # heading for must-sees that have no progression doc yet
+DEFAULT_MINUTES = 5               # time given to a must-see from the sheet that has no time of its own
+
+
+def format_minutes(total_minutes):
+    if total_minutes == int(total_minutes):
+        return f"{int(total_minutes)} min"
+    return f"{total_minutes:g} min"
+
+
+def build_lesson_plan(level_name, level_path, chosen_skills):
+    """Run the whole pipeline for the chosen level and skills and return what to show.
+
+    Nothing is drawn here. The result is a dict that render_plan() displays,
+    and that "Recent plans" can reopen later:
+      notes:      [(kind, text)] where kind is error / warning / info / success
+      skills:     the skills included in the plan
+      total_time: e.g. "12 min", or None
+      pdf:        the lesson plan PDF as bytes, or None if nothing was generated
+    """
+    entry = {
+        "level_name": level_name,
+        "skills": [],
+        "notes": [],
+        "total_time": None,
+        "pdf": None,
+        "file_name": None,
+    }
+    notes = entry["notes"]
+
+    # Pass 1: collect each skill's progressions and whatever values the level's
+    # must-sees list gives it, without filling blanks yet. Distances (meters)
+    # and times (seconds) are looked up separately so a blank expecting meters
+    # never gets a seconds value, or the reverse.
+    must_sees_lines = get_must_sees_from_level(level_path)
+    known = set(get_all_progression_names())
+    docx_skills = [s for s in chosen_skills if s in known]
+    as_written = [s for s in chosen_skills if s not in known]  # must-sees with no progression doc
+    raw_progressions = {}
+    skill_values = {}  # {skill: {"distance": .., "time": .., None: ..}}
+    for skill in docx_skills:
+        raw_progressions[skill] = get_progressions_for_skill(skill)
+        skill_values[skill] = {
+            kind: find_distance_for_skill(skill, must_sees_lines, kind)
+            for kind in ("distance", "time", None)
+        }
+
+    # Flag a genuine conflict if both Front Crawl and Back Crawl were chosen
+    # with different explicit distances. Don't silently override, just say so.
+    front_key = next(
+        (s for s in raw_progressions if normalize_name(s) == normalize_name("Front Crawl")), None
     )
+    back_key = next(
+        (s for s in raw_progressions if normalize_name(s) == normalize_name("Back Crawl")), None
+    )
+    if front_key and back_key:
+        front_dist = skill_values[front_key]["distance"]
+        back_dist = skill_values[back_key]["distance"]
+        if front_dist and back_dist and front_dist != back_dist:
+            notes.append((
+                "warning",
+                f"Front Crawl ({front_dist}m) and Back Crawl ({back_dist}m) have different "
+                "distances in the must-sees PDF. Each is used as listed. Worth double-checking.",
+            ))
+
+    # Fallback distance (meters only) for any blank that has none of its own:
+    # Front Crawl's distance for this level (the usual benchmark), or Flutter
+    # Kick's if Front Crawl isn't listed either. Blanks measured in seconds
+    # (e.g. treading water) never use these, since they're meters.
+    fallback_front_crawl = find_distance_for_skill("Front Crawl", must_sees_lines, "distance")
+    fallback_flutter_kick = find_distance_for_skill("Flutter Kick", must_sees_lines, "distance")
+
+    # Pass 2: fill in each blank according to the unit written after it.
+    filled_skills = {}
+    missing_distance = []
+    used_fallback = {}  # {"Front Crawl" | "Flutter Kick": [skill, ...]}
+
+    for skill, progressions in raw_progressions.items():
+        filled = []
+        unfilled = False
+        for p in progressions:
+            if "_" not in p:
+                filled.append(p)
+                continue
+            kind = blank_kind(p)
+            value = skill_values[skill][kind]
+            fallback_source = None
+            if not value and kind != "time":
+                if fallback_front_crawl:
+                    value, fallback_source = fallback_front_crawl, "Front Crawl"
+                elif fallback_flutter_kick:
+                    value, fallback_source = fallback_flutter_kick, "Flutter Kick"
+            if value:
+                p = p.replace("_", value)
+                if fallback_source and skill not in used_fallback.setdefault(fallback_source, []):
+                    used_fallback[fallback_source].append(skill)
+            else:
+                unfilled = True
+            filled.append(p)
+        if unfilled:
+            missing_distance.append(skill)
+        filled_skills[skill] = filled
+
+    for source, skills_list in used_fallback.items():
+        fallback_value = fallback_front_crawl if source == "Front Crawl" else fallback_flutter_kick
+        notes.append((
+            "info",
+            f"No distance listed for {', '.join(skills_list)}. Used the {source} "
+            f"distance ({fallback_value}m) for this level instead.",
+        ))
+
+    if missing_distance:
+        notes.append((
+            "warning",
+            f"No distance found in the must-sees PDF for: {', '.join(missing_distance)}. "
+            "Those progression lines still show a blank.",
+        ))
+
+    # Must-sees with no progression doc are pasted in as written, in one section at the end.
+    # They have no time of their own, so each gets DEFAULT_MINUTES (shown as "(5 min)" like the others).
+    plan_sections = dict(filled_skills)
+    if as_written:
+        plan_sections[OTHER_SECTION] = [
+            s if _TIME_TAG_PATTERN.search(s) else f"{s} ({DEFAULT_MINUTES} min)" for s in as_written
+        ]
+
+    if not plan_sections:
+        notes.append(("error", "No skills were chosen, so there is nothing to put in a plan."))
+        return entry
+
+    # Generate the PDF
+    safe_level = level_name.replace(" ", "_").replace("/", "-")
+    output_path = os.path.join(OUTPUT_DIR, f"{safe_level}_lesson_plan.pdf")
+    generate_lesson_plan_pdf(level_name, plan_sections, output_path)
+
+    notes.append(("success", f"Lesson plan ready for {level_name}."))
+
+    total_minutes = calculate_total_minutes(plan_sections)
+    entry["total_time"] = format_minutes(total_minutes) if total_minutes > 0 else None
+    entry["skills"] = list(chosen_skills)
+    entry["file_name"] = os.path.basename(output_path)
+    with open(output_path, "rb") as f:
+        entry["pdf"] = f.read()
+    return entry
 
 
-# ------------------ INPUT PARSING ------------------
+# ------------------ STEPS ------------------
+# The person moves through four steps: "program" -> "level" -> "skills" -> "plan".
+# Button clicks run these callbacks first, then the script reruns and draws the new step.
 
-def parse_user_input(user_input):
-    """
-    Split user input into level query and requested must-sees.
-    Expected format: 'Level Name — Skill 1, Skill 2, Skill 3'
-    Also handles 'Level Name: Skill 1, Skill 2' or 'Level Name Skill 1 Skill 2'
-    """
-    # Try splitting on dash or colon
-    for delimiter in [" — ", " - ", ":"]:
-        if delimiter in user_input:
-            parts = user_input.split(delimiter, 1)
-            level_query = parts[0].strip()
-            skills_raw = [s.strip() for s in parts[1].split(",")]
-            return level_query, skills_raw
+state = st.session_state
+state.setdefault("step", "program")
+state.setdefault("program", None)  # e.g. "Swimmer"
+state.setdefault("level", None)    # {"name": ..., "path": ...}
+state.setdefault("picked", [])     # skills chosen, in the order they were tapped
+state.setdefault("entry", None)    # the generated plan for the plan step
+state.setdefault("history", [])    # plans made in this browser session, newest first
+state.setdefault("next_id", 1)
 
-    # Fallback: no delimiter, treat whole thing as level query, no specific skills
-    return user_input.strip(), []
+
+def choose_program(program):
+    state.update(step="level", program=program, level=None, picked=[], entry=None)
+
+
+def choose_level(name, path):
+    state.update(step="skills", level={"name": name, "path": path}, picked=[], entry=None)
+
+
+def toggle_skill(skill):
+    if skill in state.picked:
+        state.picked.remove(skill)
+    else:
+        state.picked.append(skill)
+
+
+def start_plan():
+    state.update(step="plan", entry=None)
+
+
+def go_program():
+    state.update(step="program", program=None, level=None, picked=[], entry=None)
+
+
+def go_level():
+    state.update(step="level", level=None, picked=[], entry=None)
+
+
+def go_skills():
+    state.update(step="skills", entry=None)
+
+
+def reopen_plan(entry_id):
+    entry = next((e for e in state.history if e["id"] == entry_id), None)
+    if entry:
+        state.update(
+            step="plan",
+            entry=entry,
+            program=entry["program"],
+            level={"name": entry["level_name"], "path": entry["level_path"]},
+            picked=list(entry["skills"]),
+        )
+
+
+def render_program_step():
+    levels = list_levels()
+    with st.container(key="aa-panel-program"):
+        ui.heading("Choose a program", "Tap the program you are teaching today.")
+        if not levels:
+            st.warning(f"No level files found in the {LEVELS_DIR} folder.")
+        with st.container(key="aa-grid-prog"):
+            for i, group in enumerate(ordered_groups(levels)):
+                st.button(group, key=f"aa-prog-{i}", on_click=choose_program, args=(group,))
+
+        if state.history:
+            ui.label("Recent plans")
+            with st.container(key="aa-grid-recent"):
+                for entry in state.history[:6]:
+                    text = f"{entry['level_name']}: {', '.join(entry['skills'])}"
+                    st.button(
+                        text if len(text) <= 44 else text[:43].rstrip() + "…",
+                        key=f"aa-recent-{entry['id']}",
+                        help=text,
+                        on_click=reopen_plan,
+                        args=(entry["id"],),
+                    )
+
+
+def render_level_step():
+    levels = [l for l in list_levels() if l["group"] == state.program]
+    numbers = [l["number"] for l in levels]
+    plain_numbers = all(numbers) and len(set(numbers)) == len(numbers)
+    with st.container(key="aa-panel-level"):
+        with st.container(key="aa-actions-top"):
+            st.button("Change program", key="aa-nav-program", on_click=go_program)
+        ui.heading(f"{state.program}: choose a level", "Tap the level number.")
+        with st.container(key="aa-grid-num" if plain_numbers else "aa-grid-names"):
+            for i, level in enumerate(levels):
+                st.button(
+                    str(level["number"]) if plain_numbers else level["name"],
+                    key=f"aa-num-{i}",
+                    help=level["name"],
+                    on_click=choose_level,
+                    args=(level["name"], level["path"]),
+                )
+
+
+def skill_grid(skills, offset):
+    with st.container(key=f"aa-grid-skills-{offset}"):
+        for i, skill in enumerate(skills, start=offset):
+            on = skill in state.picked
+            st.button(
+                skill,
+                key=f"aa-skill-{'on' if on else 'off'}-{i}",
+                help="Selected. Tap to remove." if on else None,
+                on_click=toggle_skill,
+                args=(skill,),
+            )
+
+
+def render_skills_step():
+    level = state.level
+    sections, others = skills_for_level(level["path"])
+    count = len(state.picked)
+    with st.container(key="aa-panel-skills"):
+        with st.container(key="aa-actions-top"):
+            st.button("Change level", key="aa-nav-level", on_click=go_level)
+        ui.heading(
+            f"Choose skills for {level['name']}",
+            "Tap as many as you need. They go into the plan in the order you tap them.",
+        )
+        offset = 0
+        for category, skills in sections:
+            ui.label(category or "Must-sees")
+            skill_grid(skills, offset)
+            offset += len(skills)
+        if others:
+            with st.expander("More skills" if sections else "Skills", expanded=not sections):
+                skill_grid(others, offset)
+        if not sections and not others:
+            st.warning(f"No skills found for this level in the {LEVELS_DIR} or {PROGRESSIONS_DIR} folders.")
+
+        ui.count(f"{count} chosen" if count else "Choose at least one skill")
+        st.button("Make my lesson plan", key="aa-go", on_click=start_plan, disabled=not state.picked)
+
+
+def render_plan_step():
+    level = state.level
+    entry = state.entry
+
+    if entry is None:
+        with ui.loading():
+            entry = build_lesson_plan(level["name"], level["path"], state.picked)
+        entry["level_path"] = level["path"]
+        entry["program"] = state.program
+        if entry["pdf"]:
+            entry["id"] = state.next_id
+            state.next_id += 1
+            state.history.insert(0, entry)
+        state.entry = entry
+
+    with st.container(key="aa-panel-plan"):
+        ui.heading(f"Your lesson plan: {entry['level_name']}")
+        for kind, text in entry["notes"]:
+            getattr(st, kind)(text)
+
+        stats = []
+        if entry["total_time"]:
+            value, unit = entry["total_time"].split(" ", 1)
+            stats.append((value, unit, "Lesson time"))
+        if entry["skills"]:
+            n = len(entry["skills"])
+            stats.append((str(n), "", "Skills" if n != 1 else "Skill"))
+        if stats:
+            ui.big_stats(stats)
+        if entry["skills"]:
+            ui.item_list(entry["skills"])
+
+        with st.container(key="aa-actions-plan"):
+            if entry["pdf"]:
+                st.download_button(
+                    label="Download PDF",
+                    data=entry["pdf"],
+                    file_name=entry["file_name"],
+                    mime="application/pdf",
+                    key="aa-download",
+                )
+            st.button("Change skills", key="aa-nav-skills", on_click=go_skills)
+            st.button("New lesson plan", key="aa-nav-new", on_click=go_program)
+
+        if entry["pdf"]:
+            ui.pdf_frame(entry["pdf"])
 
 
 # ------------------ MAIN UI ------------------
 
-model, skill_names = build_word2vec_model()
+# Guard against a half-finished state.
+if state.step == "level" and not state.program:
+    state.step = "program"
+if state.step in ("skills", "plan") and not state.level:
+    state.step = "program"
 
-user_input = st.chat_input("Enter level and must-sees (e.g. 'Tiny Tots Level 5 — Back Crawl, Front Crawl')")
+ui.show_splash()
+ui.render_header(state.step)
 
-if user_input:
-    level_query, requested_skills = parse_user_input(user_input)
-    level_pdf_path, level_name = get_level_pdf_path(level_query)
-
-    with st.chat_message("assistant"):
-
-        if not level_pdf_path:
-            st.error("Sorry — couldn't find a level matching that name.")
-            if os.path.exists(LEVELS_DIR):
-                available = [
-                    os.path.splitext(f)[0].replace("_Must_Sees", "").replace("_", " ").title()
-                    for f in os.listdir(LEVELS_DIR)
-                    if f.endswith(".pdf")
-                ]
-                st.write("**Available levels:**")
-                for lvl in available:
-                    st.write(f"- {lvl}")
-
-        else:
-            # If no skills specified, show all must-sees for that level
-            if not requested_skills:
-                st.info(f"No must-sees specified. Here are all must-sees for **{level_name}**:")
-                must_sees = get_must_sees_from_level(level_pdf_path)
-                for ms in must_sees:
-                    st.write(f"- {ms}")
-                st.write("Re-enter with specific must-sees to generate a lesson plan.")
-
-            else:
-                # Pass 1: match each requested skill, collect raw progressions
-                # and whatever values we find, without filling blanks yet.
-                # Distances (meters) and times (seconds) are looked up
-                # separately so a blank expecting meters never gets a
-                # seconds value, or the reverse.
-                raw_progressions = {}
-                skill_values = {}  # {skill: {"distance": .., "time": .., None: ..}}
-                unmatched = []
-
-                must_sees_lines = get_must_sees_from_level(level_pdf_path)
-
-                with st.spinner("Matching skills..."):
-                    for skill_query in requested_skills:
-                        matched = match_skill(skill_query, model, skill_names)
-                        if matched:
-                            raw_progressions[matched] = get_progressions_for_skill(matched)
-                            skill_values[matched] = {
-                                kind: find_distance_for_skill(matched, must_sees_lines, kind)
-                                for kind in ("distance", "time", None)
-                            }
-                        else:
-                            unmatched.append(skill_query)
-
-                if unmatched:
-                    st.warning(f"Couldn't match these skills: {', '.join(unmatched)}")
-
-                # Flag a genuine conflict if both Front Crawl and Back Crawl
-                # were requested with different explicit distances — don't
-                # silently override, just let the person know.
-                front_key = next(
-                    (s for s in raw_progressions if normalize_name(s) == normalize_name("Front Crawl")), None
-                )
-                back_key = next(
-                    (s for s in raw_progressions if normalize_name(s) == normalize_name("Back Crawl")), None
-                )
-                if front_key and back_key:
-                    front_dist = skill_values[front_key]["distance"]
-                    back_dist = skill_values[back_key]["distance"]
-                    if front_dist and back_dist and front_dist != back_dist:
-                        st.warning(
-                            f"Front Crawl ({front_dist}m) and Back Crawl ({back_dist}m) have different "
-                            "distances in the must-sees PDF — using each as listed. Worth double-checking."
-                        )
-
-                # Fallback distance (meters only) for any blank that has none
-                # of its own: use Front Crawl's distance for this level (the
-                # usual benchmark), or Flutter Kick's if Front Crawl isn't
-                # listed either. Looked up independently of what was
-                # requested. Blanks measured in seconds (e.g. treading
-                # water) never use these, since they're meters.
-                fallback_front_crawl = find_distance_for_skill("Front Crawl", must_sees_lines, "distance")
-                fallback_flutter_kick = find_distance_for_skill("Flutter Kick", must_sees_lines, "distance")
-
-                # Pass 2: fill in each blank according to the unit written
-                # after it, falling back where needed.
-                matched_skills = {}
-                missing_distance = []
-                used_fallback = {}  # {"Front Crawl" | "Flutter Kick": [skill, ...]}
-
-                for skill, progressions in raw_progressions.items():
-                    filled = []
-                    unfilled = False
-                    for p in progressions:
-                        if "_" not in p:
-                            filled.append(p)
-                            continue
-                        kind = blank_kind(p)
-                        value = skill_values[skill][kind]
-                        fallback_source = None
-                        if not value and kind != "time":
-                            if fallback_front_crawl:
-                                value, fallback_source = fallback_front_crawl, "Front Crawl"
-                            elif fallback_flutter_kick:
-                                value, fallback_source = fallback_flutter_kick, "Flutter Kick"
-                        if value:
-                            p = p.replace("_", value)
-                            if fallback_source and skill not in used_fallback.setdefault(fallback_source, []):
-                                used_fallback[fallback_source].append(skill)
-                        else:
-                            unfilled = True
-                        filled.append(p)
-                    if unfilled:
-                        missing_distance.append(skill)
-                    matched_skills[skill] = filled
-
-                for source, skills_list in used_fallback.items():
-                    fallback_value = fallback_front_crawl if source == "Front Crawl" else fallback_flutter_kick
-                    st.info(
-                        f"No distance listed for {', '.join(skills_list)} — used the {source} "
-                        f"distance ({fallback_value}m) instead."
-                    )
-
-                if missing_distance:
-                    st.warning(
-                        f"No distance found in the must-sees PDF for: {', '.join(missing_distance)}. "
-                        "Those progression lines still show a blank — double check the wording matches."
-                    )
-
-                if matched_skills:
-                    # Generate PDF
-                    safe_level = level_name.replace(" ", "_").replace("/", "-")
-                    output_path = os.path.join(OUTPUT_DIR, f"{safe_level}_lesson_plan.pdf")
-
-                    with st.spinner("Generating lesson plan..."):
-                        generate_lesson_plan_pdf(level_name, matched_skills, output_path)
-
-                    st.success(f"Lesson plan generated for **{level_name}**!")
-
-                    total_minutes = calculate_total_minutes(matched_skills)
-                    if total_minutes > 0:
-                        time_display = (
-                            f"{int(total_minutes)} min"
-                            if total_minutes == int(total_minutes)
-                            else f"{total_minutes:g} min"
-                        )
-                        st.write(f"**Total lesson time:** {time_display}")
-
-                    # Display matched skills summary
-                    st.write("**Included must-sees:**")
-                    for skill in matched_skills:
-                        st.write(f"- {skill}")
-
-                    # Display PDF inline
-                    display_pdf(output_path)
-
-                    # Download button
-                    with open(output_path, "rb") as f:
-                        st.download_button(
-                            label="📥 Download Lesson Plan PDF",
-                            data=f,
-                            file_name=os.path.basename(output_path),
-                            mime="application/pdf",
-                        )
-                else:
-                    st.error("No skills could be matched. Please check your input and try again.")
+if state.step == "program":
+    render_program_step()
+elif state.step == "level":
+    render_level_step()
+elif state.step == "skills":
+    render_skills_step()
+else:
+    render_plan_step()

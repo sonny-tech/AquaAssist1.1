@@ -1,7 +1,4 @@
-streamlit
+streamlit>=1.39
 pdfplumber
 python-docx
-fpdf
-gensim
-scikit-learn
-numpy
+fpdf2
